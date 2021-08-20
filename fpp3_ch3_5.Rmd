@@ -1,0 +1,127 @@
+---
+title: "Chapters 3-5"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+# Data Wrangling
+
+Key notes: 
+
+* `feasts` prefers data that is in key-value pairs
+* `tsibble` can auto-detect data frequency
+
+```{r data}
+library(fpp3)
+library(feasts)
+library(readr)
+library(tsibble)
+library(lubridate)
+
+spread_ts <- read_csv('corporate_spreads.csv') %>%
+  pivot_wider(names_from = series, values_from = value) %>%
+  rename(AAA = BAMLC0A1CAAA
+         , AA = BAMLC0A2CAA
+         , A = BAMLC0A3CA
+         , BBB = BAMLC0A4CBBB
+         , BB = BAMLH0A1HYBB
+         , B = BAMLH0A2HYB
+         , CCC = BAMLH0A3HYC) %>%
+  mutate(date = index, .keep = 'unused') %>%
+  pivot_longer(-date, names_to = 'rating') %>%
+  mutate(spread = value * 100, .keep = 'unused' #yield to bps
+         , spread_diff = spread - lag(spread)
+         , rating = factor(rating, levels = c('AAA', 'AA', 'A', 'BBB', 'BB', 'B', 'CCC'))) %>% 
+  filter(!is.na(spread_diff)
+         , wday(date) == 3) %>% 
+  tsibble(key = rating)
+
+```
+
+# Data Exploration
+
+```{r, data_exploration}
+feasts::autoplot(spread_ts, spread)
+
+spread_ts %>%
+  features(spread, features = list(mean = mean, sd = sd, quantile))
+
+#tidyverse way of doing the same thing. a little more verbose
+spread_ts %>%
+  as_tibble() %>%
+  group_by(rating) %>%
+  summarise(mean = mean(spread)
+            , sd = sd(spread)
+            , p0 = quantile(spread, 0)
+            , p25 = quantile(spread, .25)
+            , p50 = quantile(spread, .50)
+            , p75 = quantile(spread, .75)
+            , p100 = quantile(spread, 1))
+```
+# Modeling Prep
+
+In most financial time series we have two main concerns: how many lags should we include? Do we have ARCH effects that need to be modeled?
+
+$$x_t = \mu+\beta_1x_{t-1} + \epsilon_t$$
+
+Notes:
+
+* The real power of features is here. We can do some powerful time series functions with one command
+```{r}
+#compute ACF of time series and ACF of first two diffs
+spread_ts %>% features(spread, feat_acf)
+
+#test for ARCH effects. maybe we need to specify a GARCH model?
+spread_ts %>% features(spread_diff, stat_arch_lm)
+
+#we can also specify our own feature. if we want to run our own VaR exceedance tests or whatever, just specify a function that returns a single value
+my_max <- function(ts){max(ts)}
+spread_ts %>% features(spread, list(max = my_max))
+```
+
+```{r fitting_models}
+fit <- spread_ts %>%
+  tsibble::fill_gaps() %>%
+  model(avg = NAIVE(spread_diff)
+        , random_walk = RW(spread_diff)
+        , ar1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 0))
+        , ar1ma1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 1)))
+
+fit %>% glance()
+fit %>% select(rating, ar1) %>% coef
+
+fit %>% forecast(h = "24 weeks")
+
+fit %>%
+  forecast(h = "24 weeks") %>%
+  filter(rating == "BBB") %>%
+  autoplot(spread_ts) 
+
+```
+
+```{r in_sample_fit}
+augment(fit)
+```
+
+```{r covid_recovery_test}
+pre_covid_train <- spread_ts %>%
+    filter_index("1997-01-07" ~ "2020-03-31")
+
+pre_covid_fit <- pre_covid_train %>%
+  tsibble::fill_gaps() %>%
+  model(avg = NAIVE(spread_diff)
+        , random_walk = RW(spread_diff)
+        , ar1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 0))
+        , ar1ma1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 1)))
+
+spread_fc <- pre_covid_fit %>% forecast(h = 24)
+
+spread_fc %>%
+  filter(rating == 'BBB') %>%
+  autoplot(pre_covid_train, level = NULL) +
+  autolayer(filter_index(spread_ts %>% filter(rating == 'BBB') %>% select(spread_diff), "2020-03-15" ~ "2020-09-15") ,colour = "black") +
+  ggplot2::coord_cartesian(xlim = ymd(c('2019-01-01', '2020-09-15')))
+```
