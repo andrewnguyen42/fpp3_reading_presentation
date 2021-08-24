@@ -20,6 +20,7 @@ library(feasts)
 library(readr)
 library(tsibble)
 library(lubridate)
+library(purrr)
 
 spread_ts <- read_csv('corporate_spreads.csv') %>%
   pivot_wider(names_from = series, values_from = value) %>%
@@ -70,7 +71,7 @@ $$x_t = \mu+\beta_1x_{t-1} + \epsilon_t$$
 Notes:
 
 * The real power of features is here. We can do some powerful time series functions with one command
-```{r}
+```{r features}
 #compute ACF of time series and ACF of first two diffs
 spread_ts %>% features(spread, feat_acf)
 
@@ -85,43 +86,136 @@ spread_ts %>% features(spread, list(max = my_max))
 ```{r fitting_models}
 fit <- spread_ts %>%
   tsibble::fill_gaps() %>%
-  model(avg = NAIVE(spread_diff)
+  model(avg = MEAN(spread_diff)
         , random_walk = RW(spread_diff)
         , ar1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 0))
         , ar1ma1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 1)))
 
-fit %>% glance()
+#question: AIC is not available for avg and random walk. fpp3 says that AIC is not comparable against model types. what have you done in the past?
+#https://stats.stackexchange.com/questions/4997/can-aic-compare-across-different-types-of-model
+fit %>% glance() %>% filter(rating == 'BBB')
+
 fit %>% select(rating, ar1) %>% coef
 
-fit %>% forecast(h = "24 weeks")
+fit %>% forecast(h = '24 weeks')
+fit %>% forecast(h = '6 months')
+fit %>% forecast(h = 24)
 
 fit %>%
   forecast(h = "24 weeks") %>%
   filter(rating == "BBB") %>%
-  autoplot(spread_ts) 
+  autoplot(spread_ts) +
+  ggplot2::coord_cartesian(xlim = ymd(c('2019-01-01', '2021-12-31')))
 
 ```
 
-```{r in_sample_fit}
-augment(fit)
-```
 
 ```{r covid_recovery_test}
 pre_covid_train <- spread_ts %>%
     filter_index("1997-01-07" ~ "2020-03-31")
 
+covid_test_period <- spread_ts %>% 
+  filter(rating == 'BBB') %>% 
+  select(spread_diff) %>%
+  filter_index("2020-03-15" ~ "2020-09-15")
+
 pre_covid_fit <- pre_covid_train %>%
   tsibble::fill_gaps() %>%
-  model(avg = NAIVE(spread_diff)
+  model(avg = MEAN(spread_diff)
         , random_walk = RW(spread_diff)
         , ar1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 0))
         , ar1ma1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 1)))
 
-spread_fc <- pre_covid_fit %>% forecast(h = 24)
+covid_spread_fc <- pre_covid_fit %>% forecast(h = 24)
 
-spread_fc %>%
+covid_spread_fc %>%
   filter(rating == 'BBB') %>%
   autoplot(pre_covid_train, level = NULL) +
-  autolayer(filter_index(spread_ts %>% filter(rating == 'BBB') %>% select(spread_diff), "2020-03-15" ~ "2020-09-15") ,colour = "black") +
+  autolayer(covid_test_period, colour = "black") +
   ggplot2::coord_cartesian(xlim = ymd(c('2019-01-01', '2020-09-15')))
+
+#comparing point accuracy
+accuracy(covid_spread_fc, covid_test_period)
+
+#comparing distributional accuracy at the 10th percentile
+#https://otexts.com/fpp3/distaccuracy.html
+accuracy(covid_spread_fc, covid_test_period, list(qs = quantile_score), probs=0.10)
 ```
+
+```{r residual_checking}
+#access fitted, residuals and transformed residuals (innovations)
+bbb_fit <- spread_ts %>%
+  fill_gaps() %>%
+  model(ar1ma1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 1))) %>%
+  filter(rating == 'BBB')
+
+augmented_fit <- augment(bbb_fit) 
+
+augmented_fit %>%
+  autoplot(.innov)
+
+augmented_fit %>%
+  ggplot(aes(x = .innov)) +
+  geom_histogram()
+
+augmented_fit %>%
+  ACF(.innov) %>%
+  autoplot() 
+
+#we can do all of these plots together using gg_tsresiduals
+bbb_fit %>%
+  gg_tsresiduals()
+
+```
+
+```{r forecast_uncertainty}
+
+bbb_fit %>%
+  forecast(h = 24)
+
+forecast_obs <- bbb_fit %>%
+  forecast(h = 24) %>%
+  pull(spread_diff) %>%
+  pluck(1)
+
+forecast_obs
+forecast_obs$mu
+forecast_obs$sigma
+
+hilo(forecast_obs, .95)$lower
+hilo(forecast_obs, .95)$upper
+
+#this is me basically giving up on extracting the ub and lb into a separate column
+#bbb_fit %>%
+#  forecast(h = 24) %>%
+#  mutate(p95 = map(spread_diff, hilo, .95)
+#         , lb = map(p95, 'lower'))
+
+```
+
+```{r transformations}
+spread_ts %>%
+  fill_gaps() %>%
+  model(ar1ma1 = ARIMA(log(spread) ~ 1 + pdq(1, 0, 1))) %>%
+  filter(rating == 'BBB') %>%
+  forecast(h = 24) #forecast is translated from log-spreads to spreads
+```
+
+```{r rolling_cross_validation, cache = TRUE}
+
+rolling_spread_ts <- spread_ts %>%
+  tsibble::fill_gaps() %>%
+  filter(rating == 'BBB') %>%
+  stretch_tsibble(.init = 24, .step = 1)
+
+
+rolling_spread_forecasts <- rolling_spread_ts %>%
+  model(avg = MEAN(spread_diff)
+        , random_walk = RW(spread_diff)
+        , ar1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 0))
+        , ar1ma1 = ARIMA(spread_diff ~ 1 + pdq(1, 0, 1))) %>%
+  forecast(h = 24) 
+
+accuracy(rolling_spread_forecasts, spread_ts %>% filter(rating == 'BBB'), by = ".model")
+```
+
